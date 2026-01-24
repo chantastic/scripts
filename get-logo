@@ -6,6 +6,7 @@ import os
 import re
 import argparse
 import requests
+import subprocess
 from difflib import get_close_matches
 from pathlib import Path
 
@@ -122,6 +123,28 @@ COMPANY_DOMAINS = {
     "kotlin": "kotlinlang.org",
 }
 
+def get_brandfetch_api_key():
+    """Get Brandfetch API key from 1Password or environment variable"""
+    # Try environment variable first (prefer new name, fallback to old for compatibility)
+    env_key = os.environ.get('BRANDFETCH_API_KEY') or os.environ.get('BRANDFETCH_CLIENT_ID')
+    if env_key:
+        return env_key
+
+    # Try 1Password CLI
+    try:
+        result = subprocess.run(
+            ['op', 'read', 'op://Private/Brandfetch/api_key', '--account', 'thechans.1password.com'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    return None
+
 def sanitize_filename(name):
     """Convert name to safe filename"""
     name = re.sub(r'[^\w\s-]', '', name.lower())
@@ -148,23 +171,57 @@ def find_domain(query):
 
     return None, None, False
 
-def fetch_logo(domain, output_name, output_dir):
+def fetch_logo(domain, output_name, output_dir, brandfetch_key=None):
     """Fetch logo from multiple sources with fallback"""
-    # Try multiple logo sources in order of quality
-    sources = [
-        f"https://unavatar.io/{domain}",
-        f"https://www.google.com/s2/favicons?domain={domain}&sz=256",
-    ]
+    sources = []
 
-    for url in sources:
+    # Prefer Brandfetch if API key is available
+    if brandfetch_key:
+        sources.append({
+            'url': f"https://api.brandfetch.io/v2/brands/{domain}",
+            'headers': {'Authorization': f'Bearer {brandfetch_key}'},
+            'extract_logo': True
+        })
+
+    # Fallback sources
+    sources.extend([
+        {'url': f"https://unavatar.io/{domain}", 'headers': {}, 'extract_logo': False},
+        {'url': f"https://www.google.com/s2/favicons?domain={domain}&sz=256", 'headers': {}, 'extract_logo': False},
+    ])
+
+    for source in sources:
         try:
-            response = requests.get(url, timeout=10, allow_redirects=True)
+            response = requests.get(
+                source['url'],
+                headers=source['headers'],
+                timeout=10,
+                allow_redirects=True
+            )
 
-            if response.status_code == 200 and len(response.content) > 100:
-                output_path = Path(output_dir) / f"{output_name}.png"
-                with open(output_path, 'wb') as f:
-                    f.write(response.content)
-                return str(output_path)
+            if response.status_code == 200:
+                # For Brandfetch, extract logo URL from JSON response
+                if source['extract_logo']:
+                    try:
+                        data = response.json()
+                        # Get the first available logo
+                        logos = data.get('logos', [])
+                        if logos:
+                            logo_url = logos[0].get('formats', [{}])[0].get('src')
+                            if logo_url:
+                                logo_response = requests.get(logo_url, timeout=10)
+                                if logo_response.status_code == 200 and len(logo_response.content) > 100:
+                                    output_path = Path(output_dir) / f"{output_name}.png"
+                                    with open(output_path, 'wb') as f:
+                                        f.write(logo_response.content)
+                                    return str(output_path)
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                # For other sources, save directly
+                elif len(response.content) > 100:
+                    output_path = Path(output_dir) / f"{output_name}.png"
+                    with open(output_path, 'wb') as f:
+                        f.write(response.content)
+                    return str(output_path)
         except Exception:
             continue
 
@@ -199,11 +256,17 @@ Examples:
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Get Brandfetch API key if available
+    brandfetch_key = get_brandfetch_api_key()
+
     queries = args.companies
     results = []
 
     print(f"Fetching {len(queries)} logo(s)...")
-    print(f"Output directory: {output_dir}\n")
+    print(f"Output directory: {output_dir}")
+    if brandfetch_key:
+        print(f"Using Brandfetch API (preferred source)")
+    print()
 
     for query in queries:
         domain, matched_name, is_exact = find_domain(query)
@@ -223,7 +286,7 @@ Examples:
         print(f"🔍 '{query}' ({match_type})")
         print(f"   Fetching from {domain}...", end=" ")
 
-        output_path = fetch_logo(domain, sanitized, output_dir)
+        output_path = fetch_logo(domain, sanitized, output_dir, brandfetch_key)
 
         if output_path:
             print(f"✓")
