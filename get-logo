@@ -1,0 +1,244 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3 python3Packages.requests
+
+import sys
+import os
+import re
+import argparse
+import requests
+from difflib import get_close_matches
+from pathlib import Path
+
+COMPANY_DOMAINS = {
+    # AI & ML
+    "openai": "openai.com",
+    "anthropic": "anthropic.com",
+    "claude": "anthropic.com",
+    "claude code": "anthropic.com",
+    "workos": "workos.com",
+    "google": "google.com",
+    "microsoft": "microsoft.com",
+    "meta": "meta.com",
+    "facebook": "facebook.com",
+    "deepmind": "deepmind.com",
+    "hugging face": "huggingface.co",
+    "huggingface": "huggingface.co",
+    "replicate": "replicate.com",
+    "stability ai": "stability.ai",
+    "midjourney": "midjourney.com",
+    "cohere": "cohere.com",
+
+    # Tech Companies
+    "apple": "apple.com",
+    "amazon": "amazon.com",
+    "netflix": "netflix.com",
+    "spotify": "spotify.com",
+    "twitter": "twitter.com",
+    "x": "x.com",
+    "linkedin": "linkedin.com",
+    "github": "github.com",
+    "gitlab": "gitlab.com",
+    "stripe": "stripe.com",
+    "vercel": "vercel.com",
+    "netlify": "netlify.com",
+    "cloudflare": "cloudflare.com",
+    "aws": "aws.amazon.com",
+    "digitalocean": "digitalocean.com",
+    "heroku": "heroku.com",
+    "docker": "docker.com",
+    "kubernetes": "kubernetes.io",
+
+    # Dev Tools
+    "figma": "figma.com",
+    "notion": "notion.so",
+    "slack": "slack.com",
+    "discord": "discord.com",
+    "zoom": "zoom.us",
+    "atlassian": "atlassian.com",
+    "jira": "atlassian.com",
+    "confluence": "atlassian.com",
+    "linear": "linear.app",
+    "postman": "postman.com",
+
+    # Databases & Infrastructure
+    "mongodb": "mongodb.com",
+    "postgresql": "postgresql.org",
+    "postgres": "postgresql.org",
+    "redis": "redis.io",
+    "elasticsearch": "elastic.co",
+    "supabase": "supabase.com",
+    "firebase": "firebase.google.com",
+    "planetscale": "planetscale.com",
+    "cockroachdb": "cockroachlabs.com",
+
+    # Cloud & Hosting
+    "azure": "azure.microsoft.com",
+    "gcp": "cloud.google.com",
+    "oracle": "oracle.com",
+    "ibm": "ibm.com",
+    "salesforce": "salesforce.com",
+
+    # Startups & SaaS
+    "airbnb": "airbnb.com",
+    "uber": "uber.com",
+    "lyft": "lyft.com",
+    "shopify": "shopify.com",
+    "square": "squareup.com",
+    "coinbase": "coinbase.com",
+    "robinhood": "robinhood.com",
+    "plaid": "plaid.com",
+    "twilio": "twilio.com",
+    "sendgrid": "sendgrid.com",
+    "mailchimp": "mailchimp.com",
+    "hubspot": "hubspot.com",
+    "zendesk": "zendesk.com",
+    "intercom": "intercom.com",
+
+    # Programming Languages & Frameworks
+    "python": "python.org",
+    "javascript": "javascript.com",
+    "typescript": "typescriptlang.org",
+    "react": "react.dev",
+    "vue": "vuejs.org",
+    "angular": "angular.io",
+    "svelte": "svelte.dev",
+    "nextjs": "nextjs.org",
+    "next.js": "nextjs.org",
+    "django": "djangoproject.com",
+    "flask": "palletsprojects.com",
+    "fastapi": "fastapi.tiangolo.com",
+    "rails": "rubyonrails.org",
+    "laravel": "laravel.com",
+    "spring": "spring.io",
+    "nodejs": "nodejs.org",
+    "node": "nodejs.org",
+    "deno": "deno.com",
+    "bun": "bun.sh",
+    "rust": "rust-lang.org",
+    "go": "go.dev",
+    "golang": "go.dev",
+    "java": "oracle.com",
+    "swift": "swift.org",
+    "kotlin": "kotlinlang.org",
+}
+
+def sanitize_filename(name):
+    """Convert name to safe filename"""
+    name = re.sub(r'[^\w\s-]', '', name.lower())
+    name = re.sub(r'[-\s]+', '-', name)
+    return name.strip('-')
+
+def find_domain(query):
+    """Find domain for a company name using fuzzy matching"""
+    query_lower = query.lower().strip()
+
+    # Exact match
+    if query_lower in COMPANY_DOMAINS:
+        return COMPANY_DOMAINS[query_lower], query, True
+
+    # Fuzzy match
+    matches = get_close_matches(query_lower, COMPANY_DOMAINS.keys(), n=1, cutoff=0.6)
+    if matches:
+        matched_key = matches[0]
+        return COMPANY_DOMAINS[matched_key], matched_key, False
+
+    # Try as domain directly if it looks like one
+    if '.' in query_lower:
+        return query_lower, query, True
+
+    return None, None, False
+
+def fetch_logo(domain, output_name, output_dir):
+    """Fetch logo from multiple sources with fallback"""
+    # Try multiple logo sources in order of quality
+    sources = [
+        f"https://unavatar.io/{domain}",
+        f"https://www.google.com/s2/favicons?domain={domain}&sz=256",
+    ]
+
+    for url in sources:
+        try:
+            response = requests.get(url, timeout=10, allow_redirects=True)
+
+            if response.status_code == 200 and len(response.content) > 100:
+                output_path = Path(output_dir) / f"{output_name}.png"
+                with open(output_path, 'wb') as f:
+                    f.write(response.content)
+                return str(output_path)
+        except Exception:
+            continue
+
+    return None
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download company logos by name",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  get-logo "OpenAI" "WorkOS" "Claude Code"
+  get-logo stripe vercel github
+  get-logo -o ./logos stripe vercel
+  get-logo --output-dir . anthropic
+        """
+    )
+    parser.add_argument(
+        'companies',
+        nargs='+',
+        help='Company names to fetch logos for'
+    )
+    parser.add_argument(
+        '-o', '--output-dir',
+        default=str(Path.home() / 'Downloads'),
+        help='Output directory for logos (default: ~/Downloads)'
+    )
+
+    args = parser.parse_args()
+
+    # Expand and create output directory
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    queries = args.companies
+    results = []
+
+    print(f"Fetching {len(queries)} logo(s)...")
+    print(f"Output directory: {output_dir}\n")
+
+    for query in queries:
+        domain, matched_name, is_exact = find_domain(query)
+
+        if not domain:
+            print(f"❌ '{query}' - No match found")
+            # Show some suggestions
+            close = get_close_matches(query.lower(), COMPANY_DOMAINS.keys(), n=3, cutoff=0.4)
+            if close:
+                print(f"   Did you mean: {', '.join(close)}")
+            results.append((query, None))
+            continue
+
+        match_type = "exact" if is_exact else f"fuzzy → {matched_name}"
+        sanitized = sanitize_filename(query)
+
+        print(f"🔍 '{query}' ({match_type})")
+        print(f"   Fetching from {domain}...", end=" ")
+
+        output_path = fetch_logo(domain, sanitized, output_dir)
+
+        if output_path:
+            print(f"✓")
+            print(f"   Saved to: {output_path}")
+            results.append((query, output_path))
+        else:
+            print(f"✗ Failed to fetch")
+            results.append((query, None))
+
+        print()
+
+    # Summary
+    successful = sum(1 for _, path in results if path)
+    print(f"{'='*50}")
+    print(f"Downloaded {successful}/{len(queries)} logo(s)")
+
+if __name__ == "__main__":
+    main()
