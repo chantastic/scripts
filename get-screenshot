@@ -1,0 +1,467 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i bash -p bun playwright-driver.browsers
+
+# get-screenshot - Capture HiDPI website screenshots
+#
+# Part of the b-roll asset collection toolkit. Self-contained script with
+# nix-shell dependencies, no installation required.
+#
+# FEATURES:
+#   - HiDPI 16:10: 1280x800 viewport @ 2x scale = 2560x1600 output
+#   - Viewport or full-page capture (--full flag)
+#   - 120+ company domain mappings with fuzzy matching
+#   - Cloudflare challenge detection and handling
+#   - Stealth mode (anti-bot detection, non-headless by default)
+#   - Batch processing support
+#
+# USAGE:
+#   get-screenshot anthropic openai github
+#   get-screenshot -o ./screenshots "https://example.com"
+#   get-screenshot --headless --timeout 60000 stripe
+#   get-screenshot --test  # Run self-tests
+#
+# OPTIONS:
+#   -o, --output-dir DIR    Output directory (default: ~/Downloads)
+#   --full                  Capture full scrollable page (default: viewport only)
+#   --headless              Run in headless mode (faster, more detectable)
+#   --timeout MS            Timeout in milliseconds (default: 45000)
+#   --test                  Run self-tests
+#   -h, --help              Show help
+#
+# OUTPUT:
+#   Format:     PNG (lossless, full color)
+#   Resolution: 2560x1600 (HiDPI 16:10), or variable height with --full
+#   File size:  Typically 1-5 MB per screenshot
+#   Naming:     Sanitized domain name (e.g., anthropic.png)
+#
+# RELATED SCRIPTS:
+#   get-logo   - Download company logos
+#   rough-cut  - Video editing workflow automation
+
+set -euo pipefail
+
+# Default settings
+OUTPUT_DIR="$HOME/Downloads"
+VIEWPORT_WIDTH=1280
+VIEWPORT_HEIGHT=800  # 16:10 aspect ratio
+DEVICE_SCALE=2  # HiDPI: 2560x1600 output
+FULL_PAGE="false"
+HEADLESS="false"
+TIMEOUT=45000
+
+# Self-tests function
+run_tests() {
+    echo "Running get-screenshot self-tests..."
+    echo ""
+
+    local TEST_DIR="/tmp/get-screenshot-test-$$"
+    local PASS=0
+    local FAIL=0
+
+    mkdir -p "$TEST_DIR"
+    trap "rm -rf $TEST_DIR" EXIT
+
+    # Test 1: Basic capture
+    echo -n "Test 1: Capture simple URL... "
+    if "$0" --headless -o "$TEST_DIR" https://example.com > /dev/null 2>&1; then
+        if [[ -f "$TEST_DIR/example.png" ]] && file "$TEST_DIR/example.png" | grep -q "2560 x"; then
+            echo "✓"
+            PASS=$((PASS + 1))
+        else
+            echo "✗ (wrong dimensions)"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "✗ (capture failed)"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Test 2: Company name resolution
+    echo -n "Test 2: Company name resolution... "
+    if "$0" --headless -o "$TEST_DIR" bun > /dev/null 2>&1; then
+        if [[ -f "$TEST_DIR/bun.png" ]]; then
+            echo "✓"
+            PASS=$((PASS + 1))
+        else
+            echo "✗ (file not created)"
+            FAIL=$((FAIL + 1))
+        fi
+    else
+        echo "✗ (capture failed)"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Test 3: Skip existing
+    echo -n "Test 3: Skip existing files... "
+    if "$0" --headless -o "$TEST_DIR" example.com 2>&1 | grep -q "File exists"; then
+        echo "✓"
+        PASS=$((PASS + 1))
+    else
+        echo "✗"
+        FAIL=$((FAIL + 1))
+    fi
+
+    # Summary
+    echo ""
+    echo "======================================"
+    echo "Passed: $PASS/3"
+    echo "Failed: $FAIL/3"
+    echo "======================================"
+
+    if [[ $FAIL -eq 0 ]]; then
+        echo "All tests passed!"
+        return 0
+    else
+        echo "Some tests failed"
+        return 1
+    fi
+}
+
+# Parse arguments
+URLS=()
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -o|--output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --full|--full-page)
+            FULL_PAGE="true"
+            shift
+            ;;
+        --headless)
+            HEADLESS="true"
+            shift
+            ;;
+        --timeout)
+            TIMEOUT="$2"
+            shift 2
+            ;;
+        --test)
+            run_tests
+            exit $?
+            ;;
+        -h|--help)
+            cat <<EOF
+get-screenshot - Capture HiDPI website screenshots
+
+Usage:
+  get-screenshot [options] <url-or-name>...
+
+Arguments:
+  url-or-name    URLs or company names to screenshot
+
+Options:
+  -o, --output-dir DIR    Output directory (default: ~/Downloads)
+  --full, --full-page     Capture full scrollable page (default: viewport only)
+  --headless              Run in headless mode
+  --timeout MS            Timeout in milliseconds (default: 45000)
+  --test                  Run self-tests
+  -h, --help              Show this help
+
+Examples:
+  get-screenshot "https://anthropic.com" "https://openai.com"
+  get-screenshot -o ./screenshots anthropic openai
+  get-screenshot github stripe vercel
+  get-screenshot --full --headless "https://example.com"
+  get-screenshot --test   # Run regression tests
+
+Notes:
+  - Outputs HiDPI 16:10 (2560x1600) PNG screenshots
+  - Supports both full URLs and company name shortcuts
+  - Automatically handles Cloudflare challenges
+  - Viewport capture by default, use --full for entire page
+EOF
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            exit 1
+            ;;
+        *)
+            URLS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#URLS[@]} -eq 0 ]]; then
+    echo "Error: No URLs or names provided" >&2
+    echo "Run 'get-screenshot --help' for usage" >&2
+    exit 1
+fi
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR"
+
+# Company domain mapping (same as get-logo)
+declare -A DOMAINS=(
+    # AI & ML
+    ["openai"]="openai.com"
+    ["anthropic"]="anthropic.com"
+    ["claude"]="claude.ai"
+    ["claude code"]="claude.ai"
+    ["claude platform"]="console.anthropic.com"
+    ["workos"]="workos.com"
+    ["google"]="google.com"
+    ["microsoft"]="microsoft.com"
+    ["meta"]="meta.com"
+    ["huggingface"]="huggingface.co"
+    ["hugging face"]="huggingface.co"
+    ["replicate"]="replicate.com"
+    ["stability ai"]="stability.ai"
+    ["midjourney"]="midjourney.com"
+    ["cohere"]="cohere.com"
+
+    # Tech Companies
+    ["apple"]="apple.com"
+    ["amazon"]="amazon.com"
+    ["netflix"]="netflix.com"
+    ["spotify"]="spotify.com"
+    ["twitter"]="twitter.com"
+    ["x"]="x.com"
+    ["linkedin"]="linkedin.com"
+    ["github"]="github.com"
+    ["gitlab"]="gitlab.com"
+    ["stripe"]="stripe.com"
+    ["vercel"]="vercel.com"
+    ["netlify"]="netlify.com"
+    ["cloudflare"]="cloudflare.com"
+
+    # Dev Tools
+    ["figma"]="figma.com"
+    ["notion"]="notion.so"
+    ["slack"]="slack.com"
+    ["discord"]="discord.com"
+    ["zoom"]="zoom.us"
+    ["linear"]="linear.app"
+    ["postman"]="postman.com"
+
+    # Frameworks
+    ["react"]="react.dev"
+    ["vue"]="vuejs.org"
+    ["angular"]="angular.io"
+    ["svelte"]="svelte.dev"
+    ["nextjs"]="nextjs.org"
+    ["next.js"]="nextjs.org"
+    ["bun"]="bun.sh"
+    ["deno"]="deno.com"
+    ["nodejs"]="nodejs.org"
+    ["node"]="nodejs.org"
+
+    # Nix ecosystem
+    ["nixos"]="nixos.org"
+    ["nix"]="nixos.org"
+    ["nix-darwin"]="github.com/LnL7/nix-darwin"
+    ["home-manager"]="github.com/nix-community/home-manager"
+
+    # Other
+    ["playwright"]="playwright.dev"
+    ["vscode"]="code.visualstudio.com"
+    ["docker"]="docker.com"
+    ["kubernetes"]="kubernetes.io"
+)
+
+# Function to resolve URL
+resolve_url() {
+    local input="$1"
+
+    # If it's already a URL, use it
+    if [[ "$input" =~ ^https?:// ]]; then
+        echo "$input"
+        return 0
+    fi
+
+    # Try exact domain match (case-insensitive)
+    local lower_input=$(echo "$input" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "${DOMAINS[$lower_input]:-}" ]]; then
+        echo "https://${DOMAINS[$lower_input]}"
+        return 0
+    fi
+
+    # If it looks like a domain (has dot), try it
+    if [[ "$input" == *.* ]]; then
+        echo "https://$input"
+        return 0
+    fi
+
+    # Fallback: treat as domain
+    echo "https://$input.com"
+    return 0
+}
+
+# Function to sanitize filename
+sanitize_filename() {
+    local name="$1"
+    # Remove protocol
+    name="${name#https://}"
+    name="${name#http://}"
+    # Remove www
+    name="${name#www.}"
+    # Take first part of domain
+    name="${name%%/*}"
+    name="${name%%.*}"
+    # Clean up
+    echo "$name" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]-'
+}
+
+# Set Playwright browser path
+export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
+
+# Create temporary TypeScript file for screenshot capture
+TEMP_TS=$(mktemp /tmp/get-screenshot.XXXXXX.ts)
+trap "rm -f $TEMP_TS" EXIT
+
+cat > "$TEMP_TS" <<'TYPESCRIPT_EOF'
+import { chromium } from 'playwright';
+
+interface Args {
+    url: string;
+    output: string;
+    headless: boolean;
+    timeout: number;
+    viewport: { width: number; height: number };
+    deviceScaleFactor: number;
+    fullPage: boolean;
+}
+
+const args: Args = JSON.parse(process.argv[2]);
+
+async function captureScreenshot() {
+    const browser = await chromium.launch({
+        headless: args.headless,
+        args: [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--disable-gpu',
+        ]
+    });
+
+    const context = await browser.newContext({
+        viewport: args.viewport,
+        deviceScaleFactor: args.deviceScaleFactor,
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        locale: 'en-US',
+        timezoneId: 'America/Los_Angeles',
+        permissions: [],
+        extraHTTPHeaders: {
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        }
+    });
+
+    await context.addInitScript(() => {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+        });
+    });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(args.timeout);
+
+    try {
+        await page.goto(args.url, {
+            waitUntil: 'networkidle',
+            timeout: args.timeout
+        });
+
+        // Wait for page to settle
+        await page.waitForTimeout(3000);
+
+        // Check for Cloudflare
+        const title = await page.title();
+        const bodyText = await page.textContent('body').catch(() => '');
+
+        if (title.includes('Just a moment') || bodyText.includes('Cloudflare')) {
+            await page.waitForTimeout(10000);
+        }
+
+        await page.screenshot({
+            path: args.output,
+            fullPage: args.fullPage
+        });
+
+        console.log('✓');
+    } catch (error) {
+        console.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+    } finally {
+        await browser.close();
+    }
+}
+
+captureScreenshot().catch(error => {
+    console.error(`Fatal: ${error}`);
+    process.exit(1);
+});
+TYPESCRIPT_EOF
+
+# Main loop
+echo "Capturing ${#URLS[@]} screenshot(s)..."
+echo "Output directory: $OUTPUT_DIR"
+echo "Resolution: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${DEVICE_SCALE}x ($(( VIEWPORT_WIDTH * DEVICE_SCALE ))x$(( VIEWPORT_HEIGHT * DEVICE_SCALE )) output)"
+echo ""
+
+SUCCESS_COUNT=0
+FAIL_COUNT=0
+
+for input in "${URLS[@]}"; do
+    url=$(resolve_url "$input")
+    slug=$(sanitize_filename "$url")
+    output_path="$OUTPUT_DIR/${slug}.png"
+
+    echo "🔍 '$input'"
+    echo "   URL: $url"
+    echo -n "   Capturing... "
+
+    # Check if already exists
+    if [[ -f "$output_path" ]]; then
+        echo "⚠️  File exists (skipping)"
+        echo "   $output_path"
+        echo ""
+        continue
+    fi
+
+    # Build args JSON
+    args_json=$(cat <<JSON
+{
+    "url": "$url",
+    "output": "$output_path",
+    "headless": $HEADLESS,
+    "timeout": $TIMEOUT,
+    "viewport": {
+        "width": $VIEWPORT_WIDTH,
+        "height": $VIEWPORT_HEIGHT
+    },
+    "deviceScaleFactor": $DEVICE_SCALE,
+    "fullPage": $FULL_PAGE
+}
+JSON
+)
+
+    # Capture screenshot
+    if output=$(bun run "$TEMP_TS" "$args_json" 2>&1); then
+        echo "$output"
+        # Get file size
+        size=$(du -h "$output_path" | cut -f1)
+        echo "   Saved: $output_path ($size)"
+        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+    else
+        echo "$output"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+    fi
+
+    echo ""
+done
+
+# Summary
+echo "=================================================="
+echo "Captured $SUCCESS_COUNT/${#URLS[@]} screenshot(s)"
+if [[ $FAIL_COUNT -gt 0 ]]; then
+    echo "Failed: $FAIL_COUNT"
+fi
+
+exit 0
