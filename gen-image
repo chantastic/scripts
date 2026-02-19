@@ -1,0 +1,416 @@
+#!/usr/bin/env nix-shell
+#!nix-shell -i python3 -p python3 python3Packages.requests
+"""
+gen-image - Generate images using Google AI (Imagen 4)
+
+Part of the content creation toolkit. Self-contained script with
+nix-shell dependencies, no installation required.
+
+FEATURES:
+  - Imagen 4 for high-quality image generation
+  - Automatic 1Password API key lookup
+  - Multiple aspect ratios (16:9, 9:16, 1:1, etc.)
+  - Batch processing from JSON prompts file
+  - Style prefix support for consistent branding
+
+USAGE:
+  gen-image "A futuristic city at sunset"
+  gen-image -o ./assets "Five lock icons on dark purple background"
+  gen-image --aspect 9:16 "Smartphone showing authentication flow"
+  gen-image --prompts ./image-prompts.json
+  gen-image --test  # Run self-tests
+
+API KEY SETUP:
+  export GOOGLE_API_KEY="your-key-here"
+  # OR use 1Password (automatic):
+  # op read "op://Private/Google AI/api_key"
+
+ASPECT RATIOS:
+  1:1, 3:4, 4:3, 9:16, 16:9
+
+RELATED SCRIPTS:
+  get-logo       - Download company logos
+  get-screenshot - Capture website screenshots
+"""
+
+import sys
+import os
+import re
+import json
+import argparse
+import subprocess
+import base64
+import requests
+from pathlib import Path
+from datetime import datetime
+
+VALID_ASPECTS = ["1:1", "3:4", "4:3", "9:16", "16:9"]
+
+# API endpoint for Imagen 4
+IMAGEN_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict"
+
+
+def get_google_ai_key():
+    """Get Google AI API key from environment variable."""
+    return os.environ.get('GOOGLE_API_KEY')
+
+
+def reexec_with_op():
+    """Re-execute this script with 1Password injecting the API key."""
+    # Use 'op run' to inject the secret as an env var and re-run this script
+    # This allows biometric auth to work properly
+    cmd = [
+        'op', 'run',
+        '--account', 'thechans.1password.com',
+        '--env-file=/dev/stdin',
+        '--no-masking',
+        '--',
+    ] + sys.argv
+
+    # Pass the env mapping via stdin
+    env_mapping = 'GOOGLE_API_KEY=op://Private/Google AI/api_key\n'
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=env_mapping,
+            text=True,
+        )
+        sys.exit(result.returncode)
+    except FileNotFoundError:
+        return False  # op not installed
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+    return True
+
+
+def sanitize_filename(prompt: str) -> str:
+    """Convert prompt to safe filename."""
+    # Take first 50 chars, lowercase, replace spaces/special chars
+    name = prompt[:50].lower()
+    name = re.sub(r'[^\w\s-]', '', name)
+    name = re.sub(r'[-\s]+', '-', name)
+    name = name.strip('-')
+    # Add timestamp for uniqueness
+    timestamp = datetime.now().strftime('%H%M%S')
+    return f"{name}-{timestamp}" if name else f"image-{timestamp}"
+
+
+def generate_image(api_key: str, prompt: str, output_path: Path, aspect_ratio: str = "16:9") -> bool:
+    """Generate a single image using Imagen 3 via REST API."""
+    try:
+        headers = {
+            "Content-Type": "application/json",
+        }
+
+        data = {
+            "instances": [
+                {"prompt": prompt}
+            ],
+            "parameters": {
+                "sampleCount": 1,
+                "aspectRatio": aspect_ratio,
+            }
+        }
+
+        url = f"{IMAGEN_API_URL}?key={api_key}"
+
+        response = requests.post(url, headers=headers, json=data, timeout=60)
+
+        if response.status_code != 200:
+            error_msg = response.text[:200] if response.text else f"HTTP {response.status_code}"
+            print(f"   Error: {error_msg}")
+            return False
+
+        result = response.json()
+
+        # Extract base64 image from response
+        predictions = result.get("predictions", [])
+        if not predictions:
+            # Check for filtering or other info in response
+            if "promptFeedback" in result:
+                feedback = result["promptFeedback"]
+                print(f"   Error: Content filtered - {feedback}")
+            else:
+                # Show what we got back for debugging
+                print(f"   Error: No images returned")
+                print(f"   Response: {json.dumps(result)[:300]}")
+            return False
+
+        # Get the first image
+        image_b64 = predictions[0].get("bytesBase64Encoded")
+        if not image_b64:
+            print("   Error: No image data in response")
+            return False
+
+        # Decode and save
+        image_bytes = base64.b64decode(image_b64)
+        with open(output_path, 'wb') as f:
+            f.write(image_bytes)
+
+        return True
+
+    except requests.exceptions.Timeout:
+        print("   Error: Request timed out")
+        return False
+    except Exception as e:
+        print(f"   Error: {e}")
+        return False
+
+
+def run_tests(api_key: str):
+    """Run self-tests to verify functionality."""
+    import tempfile
+    import shutil
+
+    print("Running gen-image self-tests...")
+    print()
+
+    test_dir = tempfile.mkdtemp(prefix='gen-image-test-')
+    passed = 0
+    failed = 0
+
+    try:
+        # Test 1: Basic image generation
+        print("Test 1: Generate simple image... ", end="", flush=True)
+        output_path = Path(test_dir) / "test1.png"
+        if generate_image(api_key, "A simple blue circle on white background, minimalist", output_path):
+            if output_path.exists() and output_path.stat().st_size > 1000:
+                print("✓")
+                passed += 1
+            else:
+                print("✗ (file too small or missing)")
+                failed += 1
+        else:
+            print("✗ (generation failed)")
+            failed += 1
+
+        # Test 2: Filename sanitization
+        print("Test 2: Filename sanitization... ", end="", flush=True)
+        result = sanitize_filename("A complex prompt with special chars!@#$%")
+        if result.startswith("a-complex-prompt-with-special-chars-"):
+            print("✓")
+            passed += 1
+        else:
+            print(f"✗ (got '{result}')")
+            failed += 1
+
+        # Test 3: Aspect ratio validation
+        print("Test 3: Aspect ratio validation... ", end="", flush=True)
+        if "16:9" in VALID_ASPECTS and "invalid" not in VALID_ASPECTS:
+            print("✓")
+            passed += 1
+        else:
+            print("✗")
+            failed += 1
+
+        print()
+        print("=" * 40)
+        print(f"Passed: {passed}/3")
+        print(f"Failed: {failed}/3")
+        print("=" * 40)
+
+        if failed == 0:
+            print("All tests passed!")
+            return 0
+        else:
+            print("Some tests failed")
+            return 1
+
+    finally:
+        shutil.rmtree(test_dir)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Generate images using Google AI (Imagen 4)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  gen-image "A futuristic city at sunset"
+  gen-image -o ./images "Lock icon on purple gradient"
+  gen-image --aspect 9:16 "Mobile app screenshot"
+  gen-image --prompts ./batch.json
+  gen-image --style "Flat design, dark background" "Five icons"
+        """
+    )
+    parser.add_argument(
+        'prompt',
+        nargs='?',
+        help='Text prompt for image generation'
+    )
+    parser.add_argument(
+        '-o', '--output-dir',
+        default=str(Path.home() / 'Downloads'),
+        help='Output directory for images (default: ~/Downloads)'
+    )
+    parser.add_argument(
+        '--output', '-O',
+        help='Specific output filename (without extension)'
+    )
+    parser.add_argument(
+        '--aspect',
+        default='16:9',
+        choices=VALID_ASPECTS,
+        help='Aspect ratio (default: 16:9)'
+    )
+    parser.add_argument(
+        '--style',
+        help='Style prefix to prepend to all prompts'
+    )
+    parser.add_argument(
+        '--prompts',
+        help='Path to JSON file with batch prompts'
+    )
+    parser.add_argument(
+        '--test',
+        action='store_true',
+        help='Run self-tests'
+    )
+
+    args = parser.parse_args()
+
+    # Get API key - try env var first, then re-exec with 1Password
+    api_key = get_google_ai_key()
+    if not api_key:
+        # Re-execute with op run to inject the secret
+        reexec_with_op()
+        # If we get here, op isn't available
+        print("❌ Google AI API key not found")
+        print("   Set GOOGLE_API_KEY environment variable")
+        print("   OR install 1Password CLI: https://1password.com/downloads/command-line/")
+        sys.exit(1)
+
+    # Handle --test flag
+    if args.test:
+        sys.exit(run_tests(api_key))
+
+    # Require prompt or prompts file
+    if not args.prompt and not args.prompts:
+        parser.error("Please provide a prompt or --prompts file")
+
+    # Expand and create output directory
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"🎨 Generating images with Imagen 4")
+    print(f"   Output directory: {output_dir}")
+    print(f"   Aspect ratio: {args.aspect}")
+    if args.style:
+        print(f"   Style prefix: {args.style[:50]}...")
+    print()
+
+    results = []
+
+    # Batch mode from JSON file
+    if args.prompts:
+        prompts_path = Path(args.prompts).expanduser()
+        if not prompts_path.exists():
+            print(f"❌ Prompts file not found: {prompts_path}")
+            sys.exit(1)
+
+        with open(prompts_path) as f:
+            data = json.load(f)
+
+        # Support both flat list and structured format
+        if isinstance(data, list):
+            prompts = [{'prompt': p} if isinstance(p, str) else p for p in data]
+        else:
+            prompts = data.get('prompts', data.get('scenes', []))
+
+        print(f"   Batch mode: {len(prompts)} prompts")
+        print()
+
+        for i, item in enumerate(prompts):
+            if isinstance(item, str):
+                prompt = item
+                name = None
+                aspect = args.aspect
+            else:
+                prompt = item.get('prompt', item.get('text', ''))
+                name = item.get('name', item.get('id'))
+                aspect = item.get('aspect_ratio', args.aspect)
+
+            if not prompt:
+                continue
+
+            # Apply style prefix
+            full_prompt = f"{args.style}. {prompt}" if args.style else prompt
+
+            # Determine filename
+            if name:
+                filename = f"{name}.png"
+            else:
+                filename = f"{sanitize_filename(prompt)}.png"
+
+            output_path = output_dir / filename
+
+            print(f"   [{i+1}/{len(prompts)}] {filename[:40]}...", end=" ", flush=True)
+
+            if output_path.exists():
+                print("⚠️  exists (skipping)")
+                results.append((prompt, str(output_path), "skipped"))
+                continue
+
+            if generate_image(api_key, full_prompt, output_path, aspect):
+                size_kb = output_path.stat().st_size / 1024
+                print(f"✓ ({size_kb:.0f} KB)")
+                results.append((prompt, str(output_path), "success"))
+            else:
+                print("✗")
+                results.append((prompt, None, "failed"))
+
+    # Single prompt mode
+    else:
+        prompt = args.prompt
+
+        # Apply style prefix
+        full_prompt = f"{args.style}. {prompt}" if args.style else prompt
+
+        # Determine filename
+        if args.output:
+            filename = f"{args.output}.png"
+        else:
+            filename = f"{sanitize_filename(prompt)}.png"
+
+        output_path = output_dir / filename
+
+        print(f"   Prompt: {prompt[:60]}{'...' if len(prompt) > 60 else ''}")
+        print(f"   Output: {filename}")
+        print()
+        print("   Generating...", end=" ", flush=True)
+
+        if output_path.exists() and not args.output:
+            print("⚠️  file exists")
+            print(f"   Use --output to specify a different name, or delete: {output_path}")
+            sys.exit(1)
+
+        if generate_image(api_key, full_prompt, output_path, args.aspect):
+            size_kb = output_path.stat().st_size / 1024
+            print(f"✓")
+            print()
+            print(f"   ✓ Saved to: {output_path} ({size_kb:.0f} KB)")
+            results.append((prompt, str(output_path), "success"))
+        else:
+            print("✗")
+            print()
+            print("   ✗ Generation failed")
+            sys.exit(1)
+
+    # Summary for batch mode
+    if args.prompts and len(results) > 1:
+        print()
+        successful = sum(1 for _, _, status in results if status == "success")
+        skipped = sum(1 for _, _, status in results if status == "skipped")
+        failed = sum(1 for _, _, status in results if status == "failed")
+        print(f"{'='*50}")
+        print(f"Generated {successful}/{len(results)} images")
+        if skipped:
+            print(f"Skipped: {skipped}")
+        if failed:
+            print(f"Failed: {failed}")
+
+
+if __name__ == "__main__":
+    main()

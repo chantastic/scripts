@@ -9,7 +9,7 @@ Generates Final Cut Pro timeline from video with automatic:
 
 Usage:
     rough-cut <video_path> [options]
-    rough-cut --test         # Run built-in tests
+    rough-cut --test         # Run tests
 
 Outputs:
     <video>.json     - Whisper transcript
@@ -21,431 +21,25 @@ Example:
 """
 
 import argparse
-import json
 import logging
-import re
 import subprocess
 import sys
 import tempfile
+import unittest
 import uuid
 from pathlib import Path
-from urllib.parse import quote
 
-# Configure logging
+from rc_common import RoughCutError
+from rc_audio import extract_audio, transcribe_audio, load_transcript, get_video_duration
+from rc_silence import detect_silences, load_silences, invert_silences
+from rc_takes import detect_takes
+from rc_fcpxml import generate_fcpxml, get_transcript_for_segment
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(message)s'
 )
 logger = logging.getLogger(__name__)
-
-
-class RoughCutError(Exception):
-    """Base exception for rough-cut errors"""
-    pass
-
-
-def run_command(cmd, description, capture_output=False, check=True):
-    """Run a shell command with error handling"""
-    logger.info(f"{description}...")
-    try:
-        if capture_output:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=check, shell=isinstance(cmd, str))
-            return result
-        else:
-            subprocess.run(cmd, check=check, shell=isinstance(cmd, str))
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Command failed: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-        if capture_output and e.stderr:
-            logger.error(f"Error: {e.stderr}")
-        raise RoughCutError(f"Failed: {description}")
-
-
-def extract_audio(video_path, output_path):
-    """Extract audio from video as 16kHz mono WAV"""
-    cmd = [
-        'ffmpeg', '-i', str(video_path),
-        '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
-        str(output_path), '-y'
-    ]
-    run_command(cmd, "Extracting audio")
-
-
-def transcribe_audio(audio_path, output_path):
-    """Transcribe audio with whisper-cli"""
-    whisper_model = Path.home() / '.whisper' / 'models' / 'ggml-large-v3-turbo.bin'
-
-    if not whisper_model.exists():
-        raise RoughCutError(f"Whisper model not found: {whisper_model}")
-
-    cmd = [
-        'whisper-cli',
-        '-m', str(whisper_model),
-        '-f', str(audio_path),
-        '--output-json'
-    ]
-
-    run_command(cmd, "Transcribing audio")
-
-    # Whisper creates {audio_name}.json next to the audio file
-    audio_name = audio_path.name
-    generated_json = audio_path.parent / f"{audio_name}.json"
-
-    if not generated_json.exists():
-        raise RoughCutError(f"Whisper did not create expected output: {generated_json}")
-
-    if generated_json != output_path:
-        generated_json.rename(output_path)
-
-
-def detect_silences(video_path, output_path, threshold_db=-45, min_duration=0.5):
-    """Detect silences with ffmpeg silencedetect"""
-    cmd = f'ffmpeg -i "{video_path}" -af silencedetect=n={threshold_db}dB:d={min_duration} -f null - 2>&1 | grep -E "silence_start|silence_end"'
-
-    result = run_command(cmd, "Detecting silences", capture_output=True, check=False)
-
-    with open(output_path, 'w') as f:
-        f.write(result.stdout)
-
-    # Count silences
-    silence_count = result.stdout.count('silence_start')
-    logger.info(f"  Found {silence_count} silence intervals")
-
-
-def load_transcript(json_path):
-    """Load whisper transcript JSON"""
-    try:
-        with open(json_path, 'r') as f:
-            data = json.load(f)
-        return data['transcription']
-    except FileNotFoundError:
-        raise RoughCutError(f"Transcript file not found: {json_path}")
-    except json.JSONDecodeError:
-        raise RoughCutError(f"Invalid JSON in transcript: {json_path}")
-    except KeyError:
-        raise RoughCutError("Transcript missing 'transcription' key")
-
-
-def load_silences(txt_path):
-    """Parse ffmpeg silence detection output"""
-    try:
-        intervals = []
-        current_start = None
-
-        with open(txt_path, 'r') as f:
-            for line in f:
-                if 'silence_start' in line:
-                    match = re.search(r'silence_start: ([\d.]+)', line)
-                    if match:
-                        current_start = float(match.group(1))
-                elif 'silence_end' in line and current_start is not None:
-                    match = re.search(r'silence_end: ([\d.]+)', line)
-                    if match:
-                        intervals.append({
-                            'start': current_start,
-                            'end': float(match.group(1))
-                        })
-                        current_start = None
-
-        return intervals
-    except FileNotFoundError:
-        raise RoughCutError(f"Silence file not found: {txt_path}")
-
-
-def get_first_words(text, n=4):
-    """Extract first n words from text, normalized"""
-    words = re.findall(r'\b\w+\b', text.lower())
-    return ' '.join(words[:n])
-
-
-def detect_takes(transcript, min_matching_words=3):
-    """
-    Detect repeated takes in transcript.
-    Returns: (removes, take_markers)
-        removes: set of segment indices to remove
-        take_markers: dict mapping kept idx to marker info
-    """
-    if not transcript:
-        return set(), {}
-
-    removes = set()
-    take_markers = {}
-
-    i = 0
-    while i < len(transcript):
-        text = transcript[i]['text'].strip()
-        first_words = get_first_words(text, min_matching_words)
-
-        if not first_words or len(first_words.split()) < min_matching_words:
-            i += 1
-            continue
-
-        take_group = [i]
-        j = i + 1
-
-        while j < len(transcript):
-            next_first = get_first_words(transcript[j]['text'].strip(), min_matching_words)
-            if next_first == first_words or (
-                len(next_first.split()) >= min_matching_words and
-                next_first.split()[:min_matching_words] == first_words.split()[:min_matching_words]
-            ):
-                take_group.append(j)
-                j += 1
-            else:
-                break
-
-        if len(take_group) > 1:
-            for idx in take_group[:-1]:
-                removes.add(idx)
-            take_markers[take_group[-1]] = {
-                'removed_count': len(take_group) - 1,
-                'sample_text': first_words
-            }
-            i = j
-        else:
-            i += 1
-
-    return removes, take_markers
-
-
-def get_kept_speech_regions(transcript, removes, min_gap=1.0):
-    """Get time regions for kept segments, merging when gap < min_gap"""
-    regions = []
-    for i, seg in enumerate(transcript):
-        if i in removes:
-            continue
-        regions.append({
-            'start': seg['offsets']['from'] / 1000,
-            'end': seg['offsets']['to'] / 1000,
-            'idx': i
-        })
-
-    if not regions:
-        return []
-
-    regions = sorted(regions, key=lambda x: x['start'])
-
-    # Merge regions with gaps smaller than min_gap
-    merged = [regions[0].copy()]
-    for r in regions[1:]:
-        gap = r['start'] - merged[-1]['end']
-        if gap < min_gap:
-            merged[-1]['end'] = r['end']
-            if 'indices' not in merged[-1]:
-                merged[-1]['indices'] = [merged[-1]['idx']]
-            merged[-1]['indices'].append(r['idx'])
-        else:
-            merged.append(r.copy())
-
-    return merged
-
-
-def merge_overlapping_regions(regions):
-    """Merge overlapping or adjacent regions"""
-    if not regions:
-        return []
-
-    merged = [regions[0].copy()]
-    for r in regions[1:]:
-        if r['start'] <= merged[-1]['end']:
-            merged[-1]['end'] = max(merged[-1]['end'], r['end'])
-        else:
-            merged.append(r.copy())
-
-    return merged
-
-
-def build_speech_segments(kept_regions, silences, video_duration):
-    """Build final speech segments by cutting at silence boundaries"""
-    if not kept_regions:
-        return []
-
-    merged_kept = merge_overlapping_regions(kept_regions)
-    segments = []
-
-    for region in merged_kept:
-        region_start = region['start']
-        region_end = region['end']
-
-        cuts_in_region = [region_start]
-
-        for silence in silences:
-            if silence['start'] >= region_start and silence['end'] <= region_end:
-                cuts_in_region.append(silence['start'])
-                cuts_in_region.append(silence['end'])
-
-        cuts_in_region.append(region_end)
-        cuts_in_region = sorted(set(cuts_in_region))
-
-        for i in range(0, len(cuts_in_region) - 1, 2):
-            seg_start = cuts_in_region[i]
-            seg_end = cuts_in_region[i + 1] if i + 1 < len(cuts_in_region) else region_end
-
-            if seg_end - seg_start > 0.3:  # Min segment duration
-                segments.append({
-                    'start': seg_start,
-                    'end': seg_end,
-                    'duration': seg_end - seg_start
-                })
-
-    return segments
-
-
-def get_transcript_for_segment(transcript, seg_start, seg_end, removes):
-    """Get transcript text and indices for a time range"""
-    texts = []
-    indices = []
-    for i, seg in enumerate(transcript):
-        if i in removes:
-            continue
-        t_start = seg['offsets']['from'] / 1000
-        t_end = seg['offsets']['to'] / 1000
-        if t_start < seg_end and t_end > seg_start:
-            texts.append(seg['text'].strip())
-            indices.append(i)
-    return ' '.join(texts), indices
-
-
-def get_take_marker_for_segment(indices, take_markers):
-    """Check if any index has a take marker"""
-    for idx in indices:
-        if idx in take_markers:
-            return take_markers[idx]
-    return None
-
-
-def sanitize_name(text, max_length=40):
-    """Clean text for FCPXML name attributes"""
-    if not text:
-        return ""
-    text = text.replace('"', "'").replace('<', '').replace('>', '')
-    text = text.replace('&', 'and').replace('/', '-')
-    return text[:max_length].strip()
-
-
-def sanitize_note(text, max_length=60):
-    """Clean text for marker note attributes"""
-    if not text:
-        return ""
-    text = text.replace('"', "'").replace('<', '').replace('>', '')
-    text = text.replace('&', 'and').replace('\n', ' ')
-    return text[:max_length].strip()
-
-
-def detect_proper_nouns(text):
-    """Detect proper nouns for B-roll markers"""
-    if not text:
-        return []
-
-    exclude = {'I', 'A', 'An', 'The', 'In', 'On', 'At', 'To', 'For', 'Of', 'And', 'Or', 'But',
-               'My', 'Your', 'His', 'Her', 'Its', 'Our', 'Their', 'We', 'You', 'He', 'She', 'It',
-               'They', 'What', 'When', 'Where', 'Why', 'How', 'This', 'That', 'These', 'Those',
-               'Let', 'Now', 'So', 'Well', 'Just', 'Then', 'Here', 'There'}
-
-    proper_nouns = set()
-    multi_word_phrases = set()
-
-    # Find multi-word capitalized phrases
-    multi_word = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b', text)
-    for phrase in multi_word:
-        proper_nouns.add(phrase)
-        multi_word_phrases.add(phrase)
-
-    # Find mid-sentence capitalized words
-    sentences = re.split(r'[.!?]\s+', text)
-
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
-            continue
-
-        words = sentence.split()
-
-        for i in range(1, len(words)):
-            word = words[i]
-            match = re.match(r'^([A-Z][a-z]+)', word)
-            if match:
-                cap_word = match.group(1)
-                if len(cap_word) < 4:  # Filter short words
-                    continue
-                if cap_word not in exclude:
-                    is_part_of_phrase = any(cap_word in phrase for phrase in multi_word_phrases)
-                    if not is_part_of_phrase:
-                        proper_nouns.add(cap_word)
-
-    return sorted(proper_nouns)
-
-
-def seconds_to_frames(seconds, fps=30):
-    """Convert seconds to frame count"""
-    return int(seconds * fps)
-
-
-def generate_fcpxml(segments, transcript, take_markers, removes, video_path, video_duration,
-                    width=2560, height=1440, post_roll_frames=2, enable_broll=True):
-    """Generate FCPXML string"""
-
-    video_name = Path(video_path).stem
-    encoded_path = quote(str(video_path), safe='/:')
-    duration_ms = int(video_duration * 1000)
-
-    clips_xml = []
-    timeline_offset = 0
-    used_take_markers = set()
-
-    for i, seg in enumerate(segments):
-        start_frames = seconds_to_frames(seg['start'])
-        duration_frames = seconds_to_frames(seg['duration']) + post_roll_frames
-
-        text, indices = get_transcript_for_segment(transcript, seg['start'], seg['end'], removes)
-        clip_name = sanitize_name(text[:50]) or f"Clip {i + 1}"
-
-        markers = ""
-
-        # Take markers
-        take_marker = get_take_marker_for_segment(indices, take_markers)
-        if take_marker and take_marker['removed_count'] > 0:
-            marker_key = take_marker['sample_text']
-            if marker_key not in used_take_markers:
-                used_take_markers.add(marker_key)
-                sample = sanitize_note(take_marker['sample_text'])
-                markers += f'\n                            <marker start="{start_frames}/30s" duration="100/3000s" value="{take_marker["removed_count"]} takes removed" completed="0" note="{sample}"/>'
-
-        # B-roll markers
-        if enable_broll:
-            proper_nouns = detect_proper_nouns(text)
-            for noun in proper_nouns:
-                markers += f'\n                            <marker start="{start_frames}/30s" duration="100/3000s" value="B-roll: {noun}"/>'
-
-        clip_xml = f'''                        <asset-clip ref="r2" offset="{timeline_offset}/30s" name="{clip_name}" start="{start_frames}/30s" duration="{duration_frames}/30s" tcFormat="NDF" audioRole="dialogue">{markers}
-                        </asset-clip>'''
-        clips_xml.append(clip_xml)
-        timeline_offset += duration_frames
-
-    fcpxml = f'''<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE fcpxml>
-
-<fcpxml version="1.13">
-    <resources>
-        <format id="r1" frameDuration="100/3000s" width="{width}" height="{height}" colorSpace="1-1-1 (Rec. 709)"/>
-        <asset id="r2" name="{video_name}" start="0s" duration="{duration_ms}00/1000s" hasVideo="1" format="r1" hasAudio="1" videoSources="1" audioSources="1" audioChannels="2" audioRate="48000">
-            <media-rep kind="original-media" src="file://{encoded_path}"/>
-        </asset>
-    </resources>
-
-    <library location="file:///Users/chan/Movies/Untitled.fcpbundle/">
-        <event name="Rough Cut">
-            <project name="Rough Cut">
-                <sequence format="r1" duration="{timeline_offset}/30s" tcStart="0s" tcFormat="NDF" audioLayout="stereo" audioRate="48k">
-                    <spine>
-{chr(10).join(clips_xml)}
-                    </spine>
-                </sequence>
-            </project>
-        </event>
-    </library>
-</fcpxml>
-'''
-    return fcpxml, timeline_offset
 
 
 def main():
@@ -468,26 +62,23 @@ Outputs:
     parser.add_argument('--width', type=int, help='Video width (default: auto-detect)')
     parser.add_argument('--height', type=int, help='Video height (default: auto-detect)')
     parser.add_argument('--post-roll', type=int, default=2, help='Post-roll frames (default: 2)')
-    parser.add_argument('--min-gap', type=float, default=1.0, help='Min gap to merge segments (default: 1.0s)')
+    parser.add_argument('--min-speech', type=float, default=0.3, help='Min speech segment duration in seconds (default: 0.3)')
     parser.add_argument('--min-matching-words', type=int, default=3, help='Words to match for takes (default: 3)')
     parser.add_argument('--no-broll', action='store_true', help='Disable B-roll markers')
     parser.add_argument('--silence-threshold', type=int, default=-45, help='Silence threshold in dB (default: -45)')
 
     args = parser.parse_args()
 
-    # Validate video exists
     video_path = Path(args.video_path).resolve()
     if not video_path.exists():
         logger.error(f"Video file not found: {video_path}")
         sys.exit(1)
 
-    # Setup output paths (Option B: extension replacement)
     video_stem = video_path.stem
     video_dir = video_path.parent
     transcript_path = video_dir / f"{video_stem}.json"
     fcpxml_path = video_dir / f"{video_stem}.fcpxml"
 
-    # Setup temp paths
     session_id = str(uuid.uuid4())[:8]
     temp_audio = Path(tempfile.gettempdir()) / f"rough-cut-{session_id}-audio.wav"
     temp_silences = Path(tempfile.gettempdir()) / f"rough-cut-{session_id}-silences.txt"
@@ -496,46 +87,52 @@ Outputs:
         logger.info(f"Processing: {video_path.name}")
         logger.info("=" * 50)
 
-        # Step 1: Extract audio
+        # 1. External tools
         extract_audio(video_path, temp_audio)
-
-        # Step 2: Transcribe
         transcribe_audio(temp_audio, transcript_path)
         logger.info(f"  Saved transcript: {transcript_path.name}")
-
-        # Step 3: Detect silences
         detect_silences(video_path, temp_silences, threshold_db=args.silence_threshold)
 
-        # Load data
-        logger.info("\nAnalyzing transcript...")
+        # 2. Load data
+        logger.info("\nLoading data...")
         transcript = load_transcript(transcript_path)
-        logger.info(f"  {len(transcript)} segments")
+        logger.info(f"  {len(transcript)} transcript segments")
 
         silences = load_silences(temp_silences)
-
-        # Get video duration
-        duration = transcript[-1]['offsets']['to'] / 1000 if transcript else 0
+        duration = get_video_duration(video_path)
         logger.info(f"  Duration: {duration/60:.1f} min")
 
-        # Detect takes
-        logger.info("\nDetecting duplicate takes...")
-        removes, take_markers = detect_takes(transcript, args.min_matching_words)
-        logger.info(f"  {len(removes)} takes to remove")
-        logger.info(f"  {len(take_markers)} segments with markers")
+        # 3. Build speech intervals (single source of truth: silence inversion)
+        logger.info("\nBuilding speech intervals...")
+        speech_intervals = invert_silences(silences, duration, min_speech=args.min_speech)
+        logger.info(f"  {len(speech_intervals)} speech intervals")
 
-        # Get kept regions
-        kept_regions = get_kept_speech_regions(transcript, removes, args.min_gap)
-        logger.info(f"\nKept speech regions: {len(kept_regions)} (merged gaps < {args.min_gap}s)")
-
-        # Build segments
-        logger.info("Building speech segments...")
-        segments = build_speech_segments(kept_regions, silences, duration)
-        logger.info(f"  {len(segments)} segments after silence cuts")
-
-        total_speech = sum(s['duration'] for s in segments)
+        total_speech = sum(s['duration'] for s in speech_intervals)
         logger.info(f"  Speech duration: {total_speech/60:.1f} min ({total_speech/duration*100:.0f}% of original)")
 
-        # Auto-detect dimensions if not provided
+        # 4. Label intervals with transcript text
+        logger.info("\nLabeling intervals with transcript...")
+        for interval in speech_intervals:
+            interval['text'], interval['indices'] = get_transcript_for_segment(
+                transcript, interval['start'], interval['end'])
+
+        # 5. Detect + remove duplicate takes
+        logger.info("\nDetecting duplicate takes...")
+        removes, take_markers = detect_takes(speech_intervals, args.min_matching_words)
+        logger.info(f"  {len(removes)} takes to remove")
+        final_intervals = [s for i, s in enumerate(speech_intervals) if i not in removes]
+
+        # Remap take_markers to final_intervals indices
+        final_markers = {}
+        final_idx = 0
+        for i, s in enumerate(speech_intervals):
+            if i in removes:
+                continue
+            if i in take_markers:
+                final_markers[final_idx] = take_markers[i]
+            final_idx += 1
+
+        # Auto-detect dimensions
         width = args.width
         height = args.height
         if not width or not height:
@@ -549,14 +146,14 @@ Outputs:
                         width = int(line.split('=')[1].strip())
                     elif 'kMDItemPixelHeight' in line:
                         height = int(line.split('=')[1].strip())
-            except:
+            except Exception:
                 width = width or 2560
                 height = height or 1440
 
-        # Generate FCPXML
+        # 6. Generate FCPXML
         logger.info("\nGenerating FCPXML...")
         fcpxml, timeline_frames = generate_fcpxml(
-            segments, transcript, take_markers, removes, video_path,
+            final_intervals, final_markers, video_path,
             duration, width, height, args.post_roll, enable_broll=not args.no_broll
         )
 
@@ -571,22 +168,20 @@ Outputs:
         logger.info(f"Original duration:  {duration/60:.1f} min")
         logger.info(f"Final duration:     {timeline_frames/30/60:.1f} min")
         logger.info(f"Time saved:         {(duration - timeline_frames/30)/60:.1f} min ({(1 - timeline_frames/30/duration)*100:.0f}%)")
-        logger.info(f"Clips:              {len(segments)}")
+        logger.info(f"Clips:              {len(final_intervals)}")
         logger.info(f"Takes removed:      {len(removes)}")
         logger.info(f"\nOutputs:")
         logger.info(f"  {transcript_path}")
         logger.info(f"  {fcpxml_path}")
 
-        # Cleanup temp files
         logger.info("\nCleaning up...")
         temp_audio.unlink(missing_ok=True)
         temp_silences.unlink(missing_ok=True)
 
-        logger.info("✓ Done!")
+        logger.info("Done!")
 
     except RoughCutError as e:
-        logger.error(f"\n✗ Error: {e}")
-        # Cleanup temp files on error too
+        logger.error(f"\nError: {e}")
         temp_audio.unlink(missing_ok=True)
         temp_silences.unlink(missing_ok=True)
         sys.exit(1)
@@ -596,199 +191,34 @@ Outputs:
         temp_silences.unlink(missing_ok=True)
         sys.exit(130)
     except Exception as e:
-        logger.error(f"\n✗ Unexpected error: {e}")
+        logger.error(f"\nUnexpected error: {e}")
         temp_audio.unlink(missing_ok=True)
         temp_silences.unlink(missing_ok=True)
         sys.exit(1)
 
 
-
-
-# ============================================================================
-# Built-in Tests
-# ============================================================================
-
-import unittest
-import xml.etree.ElementTree as ET
-
-
-class TestProperNounDetection(unittest.TestCase):
-    """Test proper noun detection for B-roll markers"""
-
-    def test_multiword_phrases(self):
-        text = "I use Claude Code and Final Cut Pro for editing."
-        result = detect_proper_nouns(text)
-        self.assertIn("Claude Code", result)
-        self.assertIn("Final Cut Pro", result)
-
-    def test_filters_short_words(self):
-        text = "Let me show you Cod and Mac tools."
-        result = detect_proper_nouns(text)
-        self.assertNotIn("Cod", result)
-        self.assertNotIn("Mac", result)
-
-    def test_filters_sentence_initial(self):
-        text = "Let me show you Python. Now we can code."
-        result = detect_proper_nouns(text)
-        self.assertNotIn("Let", result)
-        self.assertNotIn("Now", result)
-        self.assertIn("Python", result)
-
-    def test_empty_input(self):
-        result = detect_proper_nouns("")
-        self.assertEqual(result, [])
-
-
-class TestTextSanitization(unittest.TestCase):
-    """Test text sanitization for FCPXML"""
-
-    def test_sanitize_name_removes_slashes(self):
-        result = sanitize_name("test/with/slash")
-        self.assertEqual(result, "test-with-slash")
-
-    def test_sanitize_name_truncates(self):
-        long_text = "a" * 100
-        result = sanitize_name(long_text, max_length=40)
-        self.assertEqual(len(result), 40)
-
-    def test_sanitize_note_removes_newlines(self):
-        text = "line1\nline2\nline3"
-        result = sanitize_note(text)
-        self.assertNotIn("\n", result)
-
-
-class TestFirstWords(unittest.TestCase):
-    """Test first word extraction for take detection"""
-
-    def test_extracts_first_n_words(self):
-        text = "Hello world this is a test"
-        result = get_first_words(text, 3)
-        self.assertEqual(result, "hello world this")
-
-    def test_handles_punctuation(self):
-        text = "Hello, world! How are you?"
-        result = get_first_words(text, 3)
-        self.assertEqual(result, "hello world how")
-
-
-class TestTimeConversion(unittest.TestCase):
-    """Test time to frame conversion"""
-
-    def test_seconds_to_frames_30fps(self):
-        self.assertEqual(seconds_to_frames(1.0, fps=30), 30)
-        self.assertEqual(seconds_to_frames(0.5, fps=30), 15)
-
-
-class TestTakeDetection(unittest.TestCase):
-    """Test duplicate take detection"""
-
-    def test_detects_duplicate_takes(self):
-        transcript = [
-            {"offsets": {"from": 0, "to": 1000}, "text": "Hello world test"},
-            {"offsets": {"from": 1000, "to": 2000}, "text": "Hello world again"},
-            {"offsets": {"from": 2000, "to": 3000}, "text": "Hello world final"},
-            {"offsets": {"from": 3000, "to": 4000}, "text": "Different content"}
-        ]
-        removes, markers = detect_takes(transcript, min_matching_words=2)
-
-        self.assertIn(0, removes)
-        self.assertIn(1, removes)
-        self.assertNotIn(2, removes)
-        self.assertEqual(markers[2]['removed_count'], 2)
-
-    def test_empty_transcript(self):
-        removes, markers = detect_takes([], min_matching_words=3)
-        self.assertEqual(len(removes), 0)
-
-
-class TestSegmentMerging(unittest.TestCase):
-    """Test segment merging logic"""
-
-    def test_merges_close_segments(self):
-        transcript = [
-            {"offsets": {"from": 0, "to": 1000}, "text": "First"},
-            {"offsets": {"from": 1500, "to": 2000}, "text": "Second"},
-            {"offsets": {"from": 3000, "to": 4000}, "text": "Third"}
-        ]
-        removes = set()
-        regions = get_kept_speech_regions(transcript, removes, min_gap=1.0)
-
-        self.assertEqual(len(regions), 2)
-        self.assertEqual(regions[0]['start'], 0.0)
-        self.assertEqual(regions[0]['end'], 2.0)
-
-
-class TestFCPXMLGeneration(unittest.TestCase):
-    """Test FCPXML generation"""
-
-    def test_generates_valid_xml(self):
-        # Minimal test data
-        transcript = [{"offsets": {"from": 0, "to": 2000}, "text": "Test content"}]
-        segments = [{"start": 0, "end": 2, "duration": 2}]
-        removes = set()
-        markers = {}
-
-        fcpxml, timeline_frames = generate_fcpxml(
-            segments, transcript, markers, removes,
-            "test.mp4", 2.0, width=1920, height=1080
-        )
-
-        # Parse XML
-        root = ET.fromstring(fcpxml)
-        self.assertEqual(root.tag, 'fcpxml')
-        self.assertEqual(root.get('version'), '1.13')
-
-    def test_fcpxml_has_required_structure(self):
-        transcript = [{"offsets": {"from": 0, "to": 2000}, "text": "Test"}]
-        segments = [{"start": 0, "end": 2, "duration": 2}]
-        removes = set()
-        markers = {}
-
-        fcpxml, _ = generate_fcpxml(
-            segments, transcript, markers, removes,
-            "test.mp4", 2.0
-        )
-
-        root = ET.fromstring(fcpxml)
-        self.assertIsNotNone(root.find('.//resources'))
-        self.assertIsNotNone(root.find('.//library'))
-        self.assertIsNotNone(root.find('.//sequence'))
-        self.assertIsNotNone(root.find('.//spine'))
-
-
 def run_tests():
-    """Run built-in tests"""
+    """Discover and run tests from tests/ directory"""
     print("Running rough-cut tests...")
     print("=" * 50)
-    
-    # Create test suite
+
     loader = unittest.TestLoader()
-    suite = unittest.TestSuite()
-    
-    # Add test classes
-    suite.addTests(loader.loadTestsFromTestCase(TestProperNounDetection))
-    suite.addTests(loader.loadTestsFromTestCase(TestTextSanitization))
-    suite.addTests(loader.loadTestsFromTestCase(TestFirstWords))
-    suite.addTests(loader.loadTestsFromTestCase(TestTimeConversion))
-    suite.addTests(loader.loadTestsFromTestCase(TestTakeDetection))
-    suite.addTests(loader.loadTestsFromTestCase(TestSegmentMerging))
-    suite.addTests(loader.loadTestsFromTestCase(TestFCPXMLGeneration))
-    
-    # Run tests
+    tests_dir = Path(__file__).parent / 'tests'
+    suite = loader.discover(str(tests_dir), pattern='test_*.py', top_level_dir=str(Path(__file__).parent))
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
-    
+
     print("\n" + "=" * 50)
     if result.wasSuccessful():
-        print(f"✓ All {result.testsRun} tests passed!")
+        print(f"All {result.testsRun} tests passed!")
         return 0
     else:
-        print(f"✗ {len(result.failures)} failures, {len(result.errors)} errors")
+        print(f"{len(result.failures)} failures, {len(result.errors)} errors")
         return 1
 
 
 if __name__ == '__main__':
-    # Check for test flag
     if '--test' in sys.argv:
         sys.exit(run_tests())
     else:

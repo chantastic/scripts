@@ -1,45 +1,44 @@
 #!/usr/bin/env nix-shell
-#!nix-shell -i bash -p bun playwright-driver.browsers
+#!nix-shell -i bash -p bun playwright-driver.browsers ffmpeg
 
-# get-screenshot - Capture HiDPI website screenshots
+# get-video - Capture 5-second website videos
 #
 # Part of the b-roll asset collection toolkit. Self-contained script with
 # nix-shell dependencies, no installation required.
 #
 # FEATURES:
 #   - HiDPI 16:10: 1280x800 viewport @ 2x scale = 2560x1600 output
-#   - Vertical mode: mobile viewport + full-page capture for short-form video
-#   - Viewport or full-page capture (--full flag)
+#   - 5-second video capture (configurable)
 #   - 120+ company domain mappings with fuzzy matching
 #   - Cloudflare challenge detection and handling
 #   - Stealth mode (anti-bot detection, non-headless by default)
 #   - Batch processing support
 #
 # USAGE:
-#   get-screenshot anthropic openai github
-#   get-screenshot -o ./screenshots "https://example.com"
-#   get-screenshot --headless --timeout 60000 stripe
-#   get-screenshot --vertical anthropic openai  # Mobile full-page for short-form video
-#   get-screenshot --test  # Run self-tests
+#   get-video anthropic openai github
+#   get-video -o ./videos "https://example.com"
+#   get-video --headless --duration 10 stripe
+#   get-video --test  # Run self-tests
 #
 # OPTIONS:
 #   -o, --output-dir DIR    Output directory (default: ~/Downloads)
-#   --vertical              Mobile viewport + full-page capture (for short-form video scrolls)
-#   --full                  Capture full scrollable page (default: viewport only)
+#   --duration SECONDS      Video duration in seconds (default: 5)
 #   --headless              Run in headless mode (faster, more detectable)
 #   --timeout MS            Timeout in milliseconds (default: 45000)
+#   --scroll                Auto-scroll during recording
 #   --test                  Run self-tests
 #   -h, --help              Show help
 #
 # OUTPUT:
-#   Format:     PNG (lossless, full color)
-#   Resolution: 2560x1600 (HiDPI 16:10), 780x? with --vertical, or variable height with --full
-#   File size:  Typically 1-5 MB per screenshot
-#   Naming:     Sanitized domain name (e.g., anthropic.png)
+#   Format:     MP4 (H.264, converted from WebM)
+#   Resolution: 2560x1600 (HiDPI 16:10)
+#   Duration:   5 seconds (default)
+#   Naming:     Sanitized domain name (e.g., anthropic.mp4)
 #
 # RELATED SCRIPTS:
-#   get-logo   - Download company logos
-#   rough-cut  - Video editing workflow automation
+#   get-logo       - Download company logos
+#   get-screenshot - Capture website screenshots
+#   rough-cut      - Video editing workflow automation
 
 set -euo pipefail
 
@@ -48,21 +47,17 @@ OUTPUT_DIR="$HOME/Downloads"
 VIEWPORT_WIDTH=1280
 VIEWPORT_HEIGHT=800  # 16:10 aspect ratio
 DEVICE_SCALE=2  # HiDPI: 2560x1600 output
-FULL_PAGE="false"
-VERTICAL="false"
 HEADLESS="false"
 TIMEOUT=45000
-
-# User agents
-UA_DESKTOP='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-UA_MOBILE='Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+DURATION=5
+SCROLL="false"
 
 # Self-tests function
 run_tests() {
-    echo "Running get-screenshot self-tests..."
+    echo "Running get-video self-tests..."
     echo ""
 
-    local TEST_DIR="/tmp/get-screenshot-test-$$"
+    local TEST_DIR="/tmp/get-video-test-$$"
     local PASS=0
     local FAIL=0
 
@@ -70,42 +65,48 @@ run_tests() {
     trap "rm -rf $TEST_DIR" EXIT
 
     # Test 1: Basic capture
-    echo -n "Test 1: Capture simple URL... "
-    if "$0" --headless -o "$TEST_DIR" https://example.com > /dev/null 2>&1; then
-        if [[ -f "$TEST_DIR/example.png" ]] && file "$TEST_DIR/example.png" | grep -q "2560 x"; then
-            echo "✓"
-            PASS=$((PASS + 1))
+    echo -n "Test 1: Capture simple URL (3 second video)... "
+    if "$0" --headless --duration 3 -o "$TEST_DIR" https://example.com > /dev/null 2>&1; then
+        if [[ -f "$TEST_DIR/example.mp4" ]]; then
+            # Check video is valid
+            if ffprobe -v error "$TEST_DIR/example.mp4" > /dev/null 2>&1; then
+                echo "PASS"
+                PASS=$((PASS + 1))
+            else
+                echo "FAIL (invalid video)"
+                FAIL=$((FAIL + 1))
+            fi
         else
-            echo "✗ (wrong dimensions)"
+            echo "FAIL (file not created)"
             FAIL=$((FAIL + 1))
         fi
     else
-        echo "✗ (capture failed)"
+        echo "FAIL (capture failed)"
         FAIL=$((FAIL + 1))
     fi
 
     # Test 2: Company name resolution
     echo -n "Test 2: Company name resolution... "
-    if "$0" --headless -o "$TEST_DIR" bun > /dev/null 2>&1; then
-        if [[ -f "$TEST_DIR/bun.png" ]]; then
-            echo "✓"
+    if "$0" --headless --duration 3 -o "$TEST_DIR" bun > /dev/null 2>&1; then
+        if [[ -f "$TEST_DIR/bun.mp4" ]]; then
+            echo "PASS"
             PASS=$((PASS + 1))
         else
-            echo "✗ (file not created)"
+            echo "FAIL (file not created)"
             FAIL=$((FAIL + 1))
         fi
     else
-        echo "✗ (capture failed)"
+        echo "FAIL (capture failed)"
         FAIL=$((FAIL + 1))
     fi
 
     # Test 3: Skip existing
     echo -n "Test 3: Skip existing files... "
     if "$0" --headless -o "$TEST_DIR" example.com 2>&1 | grep -q "File exists"; then
-        echo "✓"
+        echo "PASS"
         PASS=$((PASS + 1))
     else
-        echo "✗"
+        echo "FAIL"
         FAIL=$((FAIL + 1))
     fi
 
@@ -133,16 +134,9 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
-        --vertical)
-            VERTICAL="true"
-            FULL_PAGE="true"
-            VIEWPORT_WIDTH=390
-            VIEWPORT_HEIGHT=844
-            shift
-            ;;
-        --full|--full-page)
-            FULL_PAGE="true"
-            shift
+        --duration)
+            DURATION="$2"
+            shift 2
             ;;
         --headless)
             HEADLESS="true"
@@ -152,43 +146,45 @@ while [[ $# -gt 0 ]]; do
             TIMEOUT="$2"
             shift 2
             ;;
+        --scroll)
+            SCROLL="true"
+            shift
+            ;;
         --test)
             run_tests
             exit $?
             ;;
         -h|--help)
             cat <<EOF
-get-screenshot - Capture HiDPI website screenshots
+get-video - Capture 5-second website videos
 
 Usage:
-  get-screenshot [options] <url-or-name>...
+  get-video [options] <url-or-name>...
 
 Arguments:
-  url-or-name    URLs or company names to screenshot
+  url-or-name    URLs or company names to record
 
 Options:
   -o, --output-dir DIR    Output directory (default: ~/Downloads)
-  --vertical              Mobile viewport + full-page for short-form video scrolls
-  --full, --full-page     Capture full scrollable page (default: viewport only)
+  --duration SECONDS      Video duration in seconds (default: 5)
   --headless              Run in headless mode
   --timeout MS            Timeout in milliseconds (default: 45000)
+  --scroll                Auto-scroll during recording
   --test                  Run self-tests
   -h, --help              Show this help
 
 Examples:
-  get-screenshot "https://anthropic.com" "https://openai.com"
-  get-screenshot -o ./screenshots anthropic openai
-  get-screenshot github stripe vercel
-  get-screenshot --vertical anthropic openai   # Mobile full-page for video scrolls
-  get-screenshot --full --headless "https://example.com"
-  get-screenshot --test   # Run regression tests
+  get-video "https://anthropic.com" "https://openai.com"
+  get-video -o ./videos anthropic openai
+  get-video github stripe vercel
+  get-video --duration 10 --scroll "https://example.com"
+  get-video --test   # Run regression tests
 
 Notes:
-  - Outputs HiDPI 16:10 (2560x1600) PNG screenshots
-  - --vertical uses mobile viewport (390x844 @ 2x) with full-page capture
+  - Outputs HiDPI 16:10 (2560x1600) MP4 videos
   - Supports both full URLs and company name shortcuts
   - Automatically handles Cloudflare challenges
-  - Viewport capture by default, use --full for entire page
+  - Default duration is 5 seconds
 EOF
             exit 0
             ;;
@@ -205,14 +201,14 @@ done
 
 if [[ ${#URLS[@]} -eq 0 ]]; then
     echo "Error: No URLs or names provided" >&2
-    echo "Run 'get-screenshot --help' for usage" >&2
+    echo "Run 'get-video --help' for usage" >&2
     exit 1
 fi
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
-# Company domain mapping (same as get-logo)
+# Company domain mapping (same as get-screenshot)
 declare -A DOMAINS=(
     # AI & ML
     ["openai"]="openai.com"
@@ -326,28 +322,30 @@ sanitize_filename() {
 # Set Playwright browser path
 export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$HOME/.cache/ms-playwright}"
 
-# Create temporary TypeScript file for screenshot capture
-TEMP_TS=$(mktemp /tmp/get-screenshot.XXXXXX.ts)
+# Create temporary TypeScript file for video capture
+TEMP_TS=$(mktemp /tmp/get-video.XXXXXX.ts)
 trap "rm -f $TEMP_TS" EXIT
 
 cat > "$TEMP_TS" <<'TYPESCRIPT_EOF'
 import { chromium } from 'playwright';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface Args {
     url: string;
-    output: string;
+    outputDir: string;
+    slug: string;
     headless: boolean;
     timeout: number;
     viewport: { width: number; height: number };
     deviceScaleFactor: number;
-    fullPage: boolean;
-    userAgent: string;
-    isMobile: boolean;
+    duration: number;
+    scroll: boolean;
 }
 
 const args: Args = JSON.parse(process.argv[2]);
 
-async function captureScreenshot() {
+async function captureVideo() {
     const browser = await chromium.launch({
         headless: args.headless,
         args: [
@@ -360,18 +358,26 @@ async function captureScreenshot() {
         ]
     });
 
+    // Create temp directory for video
+    const tempDir = fs.mkdtempSync('/tmp/get-video-');
+
     const context = await browser.newContext({
         viewport: args.viewport,
         deviceScaleFactor: args.deviceScaleFactor,
-        userAgent: args.userAgent,
-        isMobile: args.isMobile,
-        hasTouch: args.isMobile,
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         locale: 'en-US',
         timezoneId: 'America/Los_Angeles',
         permissions: [],
         extraHTTPHeaders: {
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        },
+        recordVideo: {
+            dir: tempDir,
+            size: {
+                width: args.viewport.width * args.deviceScaleFactor,
+                height: args.viewport.height * args.deviceScaleFactor
+            }
         }
     });
 
@@ -391,44 +397,75 @@ async function captureScreenshot() {
         });
 
         // Wait for page to settle
-        await page.waitForTimeout(3000);
+        await page.waitForTimeout(2000);
 
         // Check for Cloudflare
         const title = await page.title();
         const bodyText = await page.textContent('body').catch(() => '');
 
         if (title.includes('Just a moment') || bodyText.includes('Cloudflare')) {
+            console.error('   Waiting for Cloudflare...');
             await page.waitForTimeout(10000);
         }
 
-        await page.screenshot({
-            path: args.output,
-            fullPage: args.fullPage
-        });
+        // Record for specified duration
+        if (args.scroll) {
+            // Smooth scroll during recording
+            const scrollDuration = args.duration * 1000;
+            const scrollInterval = 100;
+            const scrollSteps = scrollDuration / scrollInterval;
 
-        console.log('✓');
+            const pageHeight = await page.evaluate(() => document.body.scrollHeight);
+            const viewportHeight = args.viewport.height;
+            const scrollDistance = Math.max(0, pageHeight - viewportHeight);
+            const scrollPerStep = scrollDistance / scrollSteps;
+
+            for (let i = 0; i < scrollSteps; i++) {
+                await page.evaluate((y) => window.scrollTo({ top: y, behavior: 'auto' }), scrollPerStep * i);
+                await page.waitForTimeout(scrollInterval);
+            }
+        } else {
+            // Just wait for the duration
+            await page.waitForTimeout(args.duration * 1000);
+        }
+
+        // Close page and context to finalize video
+        await page.close();
+        await context.close();
+
+        // Find the recorded video
+        const files = fs.readdirSync(tempDir);
+        const webmFile = files.find(f => f.endsWith('.webm'));
+
+        if (!webmFile) {
+            throw new Error('No video file was created');
+        }
+
+        const webmPath = path.join(tempDir, webmFile);
+
+        // Output the webm path for bash to convert
+        console.log(`WEBM_PATH:${webmPath}`);
+        console.log('OK');
+
     } catch (error) {
-        console.error(`✗ ${error instanceof Error ? error.message : String(error)}`);
+        console.error(`ERROR:${error instanceof Error ? error.message : String(error)}`);
         process.exit(1);
     } finally {
         await browser.close();
     }
 }
 
-captureScreenshot().catch(error => {
+captureVideo().catch(error => {
     console.error(`Fatal: ${error}`);
     process.exit(1);
 });
 TYPESCRIPT_EOF
 
 # Main loop
-echo "Capturing ${#URLS[@]} screenshot(s)..."
+echo "Recording ${#URLS[@]} video(s)..."
 echo "Output directory: $OUTPUT_DIR"
-if [[ "$VERTICAL" == "true" ]]; then
-    echo "Mode: vertical (mobile ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${DEVICE_SCALE}x, full-page)"
-else
-    echo "Resolution: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${DEVICE_SCALE}x ($(( VIEWPORT_WIDTH * DEVICE_SCALE ))x$(( VIEWPORT_HEIGHT * DEVICE_SCALE )) output)"
-fi
+echo "Resolution: ${VIEWPORT_WIDTH}x${VIEWPORT_HEIGHT} @ ${DEVICE_SCALE}x ($(( VIEWPORT_WIDTH * DEVICE_SCALE ))x$(( VIEWPORT_HEIGHT * DEVICE_SCALE )) output)"
+echo "Duration: ${DURATION}s"
 echo ""
 
 SUCCESS_COUNT=0
@@ -437,38 +474,27 @@ FAIL_COUNT=0
 for input in "${URLS[@]}"; do
     url=$(resolve_url "$input")
     slug=$(sanitize_filename "$url")
-    if [[ "$VERTICAL" == "true" ]]; then
-        output_path="$OUTPUT_DIR/${slug}-vertical.png"
-    else
-        output_path="$OUTPUT_DIR/${slug}.png"
-    fi
+    output_path="$OUTPUT_DIR/${slug}.mp4"
 
-    echo "🔍 '$input'"
+    echo "Recording '$input'"
     echo "   URL: $url"
-    echo -n "   Capturing... "
 
     # Check if already exists
     if [[ -f "$output_path" ]]; then
-        echo "⚠️  File exists (skipping)"
+        echo "   File exists (skipping)"
         echo "   $output_path"
         echo ""
         continue
     fi
 
-    # Select user agent based on mode
-    if [[ "$VERTICAL" == "true" ]]; then
-        USER_AGENT="$UA_MOBILE"
-        IS_MOBILE="true"
-    else
-        USER_AGENT="$UA_DESKTOP"
-        IS_MOBILE="false"
-    fi
+    echo -n "   Capturing ${DURATION}s video... "
 
     # Build args JSON
     args_json=$(cat <<JSON
 {
     "url": "$url",
-    "output": "$output_path",
+    "outputDir": "$OUTPUT_DIR",
+    "slug": "$slug",
     "headless": $HEADLESS,
     "timeout": $TIMEOUT,
     "viewport": {
@@ -476,22 +502,47 @@ for input in "${URLS[@]}"; do
         "height": $VIEWPORT_HEIGHT
     },
     "deviceScaleFactor": $DEVICE_SCALE,
-    "fullPage": $FULL_PAGE,
-    "userAgent": "$USER_AGENT",
-    "isMobile": $IS_MOBILE
+    "duration": $DURATION,
+    "scroll": $SCROLL
 }
 JSON
 )
 
-    # Capture screenshot
+    # Capture video
     if output=$(bun run "$TEMP_TS" "$args_json" 2>&1); then
-        echo "$output"
-        # Get file size
-        size=$(du -h "$output_path" | cut -f1)
-        echo "   Saved: $output_path ($size)"
-        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        # Parse output to get webm path
+        webm_path=$(echo "$output" | grep "^WEBM_PATH:" | cut -d: -f2-)
+
+        if [[ -n "$webm_path" && -f "$webm_path" ]]; then
+            echo "done"
+            echo -n "   Converting to MP4... "
+
+            # Convert webm to mp4 with ffmpeg
+            if ffmpeg -y -i "$webm_path" -c:v libx264 -preset fast -crf 18 -pix_fmt yuv420p "$output_path" > /dev/null 2>&1; then
+                echo "done"
+                # Clean up webm
+                rm -f "$webm_path"
+                rm -rf "$(dirname "$webm_path")"
+
+                # Get file size and duration
+                size=$(du -h "$output_path" | cut -f1)
+                duration_actual=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$output_path" 2>/dev/null | cut -d. -f1)
+                echo "   Saved: $output_path ($size, ${duration_actual}s)"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+                echo "FAILED"
+                echo "   Error: ffmpeg conversion failed"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+        else
+            echo "FAILED"
+            echo "   Error: No video file created"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
     else
-        echo "$output"
+        echo "FAILED"
+        error_msg=$(echo "$output" | grep "^ERROR:" | cut -d: -f2- || echo "$output")
+        echo "   Error: $error_msg"
         FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 
@@ -500,7 +551,7 @@ done
 
 # Summary
 echo "=================================================="
-echo "Captured $SUCCESS_COUNT/${#URLS[@]} screenshot(s)"
+echo "Recorded $SUCCESS_COUNT/${#URLS[@]} video(s)"
 if [[ $FAIL_COUNT -gt 0 ]]; then
     echo "Failed: $FAIL_COUNT"
 fi
