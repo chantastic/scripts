@@ -72,3 +72,16 @@ def get_video_duration(video_path):
         return float(result.stdout.strip())
     except ValueError:
         raise RoughCutError(f"Could not parse video duration: {result.stdout}")
+
+
+def get_transcript_for_segment(transcript, seg_start, seg_end):
+    """Get transcript text for a time range by overlap"""
+    texts = []
+    indices = []
+    for i, seg in enumerate(transcript):
+        t_start = seg['offsets']['from'] / 1000
+        t_end = seg['offsets']['to'] / 1000
+        if t_start < seg_end and t_end > seg_start:
+            texts.append(seg['text'].strip())
+            indices.append(i)
+    return ' '.join(texts), indices

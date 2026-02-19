@@ -2,10 +2,18 @@
 """
 Rough Cut - Video Timeline Generator
 
-Generates Final Cut Pro timeline from video with automatic:
+Generates OTIO (OpenTimelineIO) timeline from video with automatic:
 - Silence removal (ffmpeg silencedetect)
+- Empty clip removal (no transcript = noise)
 - Duplicate take detection (whisper transcript analysis)
-- B-roll markers (proper noun detection)
+
+OTIO was chosen as the interchange format over EDL (single track, no markers,
+no metadata), AAF (binary, hard to generate), and hand-rolled FCPXML (verbose,
+FCP-specific, no ffmpeg path). OTIO is JSON-based, has a Python-first API, and
+built-in adapters for FCPXML, EDL, and AAF.
+
+Each script in the pipeline is atomic — reads .otio, transforms it, writes .otio.
+Export is a separate step so the same timeline can target FCP, ffmpeg, etc.
 
 Usage:
     rough-cut <video_path> [options]
@@ -13,27 +21,36 @@ Usage:
 
 Outputs:
     <video>.json     - Whisper transcript
-    <video>.fcpxml   - Final Cut Pro timeline
+    <video>.otio     - OpenTimelineIO timeline
+
+Pipeline:
+    rough-cut my-video.mov           # produce .otio
+    add-broll my-video.otio          # augment with B-roll markers
+    export-cut my-video.otio         # export to FCPXML, ffmpeg, etc.
 
 Example:
     rough-cut my-video.mov
-    rough-cut my-video.mov --width 1920 --height 1080 --no-broll
+    rough-cut my-video.mov --post-roll 4
 """
 
 import argparse
 import logging
-import subprocess
 import sys
 import tempfile
 import unittest
 import uuid
 from pathlib import Path
 
+try:
+    import opentimelineio as otio
+except ImportError:
+    print("Error: opentimelineio required. Install with: pip install opentimelineio")
+    sys.exit(1)
+
 from rc_common import RoughCutError
-from rc_audio import extract_audio, transcribe_audio, load_transcript, get_video_duration
+from rc_audio import extract_audio, transcribe_audio, load_transcript, get_video_duration, get_transcript_for_segment
 from rc_silence import detect_silences, load_silences, invert_silences
 from rc_takes import detect_takes
-from rc_fcpxml import generate_fcpxml, get_transcript_for_segment
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,29 +59,89 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def build_otio_timeline(intervals, take_markers, video_path, duration, post_roll_frames=2, fps=30):
+    """Build an OTIO timeline from speech intervals"""
+
+    timeline = otio.schema.Timeline(name="Rough Cut")
+    timeline.metadata["rough-cut"] = {
+        "source_video": str(video_path),
+        "video_duration": duration,
+        "fps": fps,
+    }
+
+    track = otio.schema.Track(name="Main", kind=otio.schema.TrackKind.Video)
+
+    for i, interval in enumerate(intervals):
+        media_ref = otio.schema.ExternalReference(
+            target_url=Path(video_path).as_uri(),
+            available_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, fps),
+                duration=otio.opentime.RationalTime(int(duration * fps), fps)
+            )
+        )
+
+        start_frames = int(interval['start'] * fps)
+        duration_frames = int(interval['duration'] * fps) + post_roll_frames
+
+        clip = otio.schema.Clip(
+            name=interval.get('text', '').strip()[:40] or f"Clip {i+1}",
+            media_reference=media_ref,
+            source_range=otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(start_frames, fps),
+                duration=otio.opentime.RationalTime(duration_frames, fps)
+            ),
+            metadata={
+                "rough-cut": {
+                    "transcript": interval.get('text', ''),
+                    "transcript_indices": interval.get('indices', []),
+                }
+            }
+        )
+
+        if i in take_markers:
+            info = take_markers[i]
+            marker = otio.schema.Marker(
+                name=f"{info['removed_count']} takes removed",
+                marked_range=otio.opentime.TimeRange(
+                    start_time=otio.opentime.RationalTime(0, fps),
+                    duration=otio.opentime.RationalTime(1, fps)
+                ),
+                color=otio.schema.MarkerColor.RED,
+                metadata={
+                    "rough-cut": {
+                        "type": "take",
+                        "removed_count": info['removed_count'],
+                        "sample_text": info['sample_text'],
+                    }
+                }
+            )
+            clip.markers.append(marker)
+
+        track.append(clip)
+
+    timeline.tracks.append(track)
+    return timeline
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Generate Final Cut Pro timeline with automatic silence removal and take detection',
+        description='Generate OTIO timeline with automatic silence removal and take detection',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   rough-cut my-video.mov
-  rough-cut my-video.mov --width 1920 --height 1080
-  rough-cut my-video.mov --no-broll
+  rough-cut my-video.mov --post-roll 4
 
 Outputs:
   my-video.json     - Whisper transcript
-  my-video.fcpxml   - Final Cut Pro timeline
+  my-video.otio     - OpenTimelineIO timeline
         """
     )
 
     parser.add_argument('video_path', help='Path to video file')
-    parser.add_argument('--width', type=int, help='Video width (default: auto-detect)')
-    parser.add_argument('--height', type=int, help='Video height (default: auto-detect)')
     parser.add_argument('--post-roll', type=int, default=2, help='Post-roll frames (default: 2)')
     parser.add_argument('--min-speech', type=float, default=0.3, help='Min speech segment duration in seconds (default: 0.3)')
     parser.add_argument('--min-matching-words', type=int, default=3, help='Words to match for takes (default: 3)')
-    parser.add_argument('--no-broll', action='store_true', help='Disable B-roll markers')
     parser.add_argument('--silence-threshold', type=int, default=-45, help='Silence threshold in dB (default: -45)')
 
     args = parser.parse_args()
@@ -77,7 +154,7 @@ Outputs:
     video_stem = video_path.stem
     video_dir = video_path.parent
     transcript_path = video_dir / f"{video_stem}.json"
-    fcpxml_path = video_dir / f"{video_stem}.fcpxml"
+    otio_path = video_dir / f"{video_stem}.otio"
 
     session_id = str(uuid.uuid4())[:8]
     temp_audio = Path(tempfile.gettempdir()) / f"rough-cut-{session_id}-audio.wav"
@@ -102,7 +179,7 @@ Outputs:
         duration = get_video_duration(video_path)
         logger.info(f"  Duration: {duration/60:.1f} min")
 
-        # 3. Build speech intervals (single source of truth: silence inversion)
+        # 3. Build speech intervals (invert silences)
         logger.info("\nBuilding speech intervals...")
         speech_intervals = invert_silences(silences, duration, min_speech=args.min_speech)
         logger.info(f"  {len(speech_intervals)} speech intervals")
@@ -116,7 +193,18 @@ Outputs:
             interval['text'], interval['indices'] = get_transcript_for_segment(
                 transcript, interval['start'], interval['end'])
 
-        # 5. Detect + remove duplicate takes
+        # 5. Remove empty clips (noise that bypassed silence detection)
+        # Silence detection misses low-grade noise (fan hum, typing, desk bumps).
+        # These intervals survive as "speech" but whisper produces no transcript
+        # for them. No transcript = not speech. This MUST run before take detection
+        # (step 6), otherwise take matching could pair noise clips with real speech.
+        logger.info("\nFiltering empty clips...")
+        before_count = len(speech_intervals)
+        speech_intervals = [s for s in speech_intervals if s.get('text', '').strip()]
+        removed_empty = before_count - len(speech_intervals)
+        logger.info(f"  Removed {removed_empty} empty clips (noise)")
+
+        # 6. Detect + remove duplicate takes
         logger.info("\nDetecting duplicate takes...")
         removes, take_markers = detect_takes(speech_intervals, args.min_matching_words)
         logger.info(f"  {len(removes)} takes to remove")
@@ -132,47 +220,39 @@ Outputs:
                 final_markers[final_idx] = take_markers[i]
             final_idx += 1
 
-        # Auto-detect dimensions
-        width = args.width
-        height = args.height
-        if not width or not height:
-            try:
-                result = subprocess.run(
-                    ['mdls', '-name', 'kMDItemPixelWidth', '-name', 'kMDItemPixelHeight', str(video_path)],
-                    capture_output=True, text=True, check=True
-                )
-                for line in result.stdout.split('\n'):
-                    if 'kMDItemPixelWidth' in line:
-                        width = int(line.split('=')[1].strip())
-                    elif 'kMDItemPixelHeight' in line:
-                        height = int(line.split('=')[1].strip())
-            except Exception:
-                width = width or 2560
-                height = height or 1440
-
-        # 6. Generate FCPXML
-        logger.info("\nGenerating FCPXML...")
-        fcpxml, timeline_frames = generate_fcpxml(
+        # 7. Build OTIO timeline
+        logger.info("\nBuilding OTIO timeline...")
+        timeline = build_otio_timeline(
             final_intervals, final_markers, video_path,
-            duration, width, height, args.post_roll, enable_broll=not args.no_broll
+            duration, args.post_roll
         )
 
-        with open(fcpxml_path, 'w') as f:
-            f.write(fcpxml)
-        logger.info(f"  Saved timeline: {fcpxml_path.name}")
+        otio.adapters.write_to_file(timeline, str(otio_path))
+        logger.info(f"  Saved timeline: {otio_path.name}")
 
         # Summary
+        total_frames = sum(
+            int(clip.source_range.duration.value)
+            for clip in timeline.tracks[0]
+            if isinstance(clip, otio.schema.Clip)
+        )
+        fps = 30
+
         logger.info("\n" + "=" * 50)
         logger.info("SUMMARY")
         logger.info("=" * 50)
         logger.info(f"Original duration:  {duration/60:.1f} min")
-        logger.info(f"Final duration:     {timeline_frames/30/60:.1f} min")
-        logger.info(f"Time saved:         {(duration - timeline_frames/30)/60:.1f} min ({(1 - timeline_frames/30/duration)*100:.0f}%)")
+        logger.info(f"Final duration:     {total_frames/fps/60:.1f} min")
+        logger.info(f"Time saved:         {(duration - total_frames/fps)/60:.1f} min ({(1 - total_frames/fps/duration)*100:.0f}%)")
         logger.info(f"Clips:              {len(final_intervals)}")
+        logger.info(f"Empty removed:      {removed_empty}")
         logger.info(f"Takes removed:      {len(removes)}")
         logger.info(f"\nOutputs:")
         logger.info(f"  {transcript_path}")
-        logger.info(f"  {fcpxml_path}")
+        logger.info(f"  {otio_path}")
+        logger.info(f"\nNext steps:")
+        logger.info(f"  add-broll {otio_path.name}          # add B-roll markers")
+        logger.info(f"  export-cut {otio_path.name}         # export to FCPXML/ffmpeg")
 
         logger.info("\nCleaning up...")
         temp_audio.unlink(missing_ok=True)
